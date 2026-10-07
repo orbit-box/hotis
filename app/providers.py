@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 import httpx
 
@@ -6,72 +6,87 @@ from app.config import settings
 from app.models import EconomicEvent
 
 
-TE_BASE = "https://api.tradingeconomics.com"
+TV_CALENDAR_URL = "https://economic-calendar.tradingview.com/events"
 BINANCE_BASE = "https://api.binance.com"
 
 
 def _parse_dt(value: str) -> datetime:
     value = value.replace("Z", "+00:00")
-    dt = datetime.fromisoformat(value)
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return datetime.fromisoformat(value)
 
 
-def _num(item: dict[str, Any], numeric_name: str, text_name: str):
-    v = item.get(numeric_name)
-    if isinstance(v, (int, float)):
-        return float(v)
-    raw = item.get(text_name)
-    if raw is None or raw == "":
+def _display(value: Any, unit: str | None, scale: str | None) -> str | None:
+    if value is None or value == "":
         return None
-    s = str(raw).replace(",", "").replace("%", "").strip().upper()
-    mult = 1.0
-    if s.endswith("K"):
-        mult, s = 1_000.0, s[:-1]
-    elif s.endswith("M"):
-        mult, s = 1_000_000.0, s[:-1]
-    elif s.endswith("B"):
-        mult, s = 1_000_000_000.0, s[:-1]
+    if isinstance(value, float) and value.is_integer():
+        base = str(int(value))
+    else:
+        base = str(value)
+    if scale:
+        base += scale
+    if unit:
+        base += unit
+    return base
+
+
+def _num(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
     try:
-        return float(s) * mult
-    except ValueError:
+        return float(value)
+    except (TypeError, ValueError):
         return None
 
 
 async def fetch_calendar(start_date: str, end_date: str) -> list[EconomicEvent]:
-    country = settings.country.lower().replace(" ", "%20")
-    url = f"{TE_BASE}/calendar/country/{country}/{start_date}/{end_date}"
+    start = f"{start_date}T00:00:00.000Z"
+    end = f"{end_date}T23:59:59.999Z"
     params = {
-        "c": settings.trading_economics_api_key,
-        "importance": settings.min_importance,
-        "values": "true",
-        "f": "json",
+        "from": start,
+        "to": end,
+        "countries": settings.country_code,
+        "minImportance": settings.min_importance,
     }
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
+    headers = {
+        "Origin": "https://www.tradingview.com",
+        "User-Agent": "Mozilla/5.0 hotis-economic-bot/1.0",
+        "Accept": "application/json,text/plain,*/*",
+    }
 
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        r = await client.get(TV_CALENDAR_URL, params=params, headers=headers)
+        r.raise_for_status()
+        payload = r.json()
+
+    data = payload.get("result", [])
     events: list[EconomicEvent] = []
     for item in data:
-        importance = int(item.get("Importance") or 0)
+        importance = int(item.get("importance") if item.get("importance") is not None else -1)
         if importance < settings.min_importance:
             continue
+
+        unit = item.get("unit") or ""
+        scale = item.get("scale") or ""
+        actual_raw = item.get("actual")
+        previous_raw = item.get("previous")
+        forecast_raw = item.get("forecast")
+
         events.append(EconomicEvent(
-            calendar_id=str(item.get("CalendarId", "")),
-            date_utc=_parse_dt(item["Date"]),
-            country=item.get("Country", ""),
-            category=item.get("Category", ""),
-            event=item.get("Event", ""),
-            actual=item.get("Actual") or None,
-            previous=item.get("Previous") or None,
-            forecast=item.get("Forecast") or None,
-            te_forecast=item.get("TEForecast") or None,
+            calendar_id=str(item.get("id", "")),
+            date_utc=_parse_dt(item["date"]),
+            country=item.get("country", ""),
+            category=item.get("indicator", "") or "",
+            event=item.get("title", "") or item.get("indicator", ""),
+            actual=_display(actual_raw, unit, scale),
+            previous=_display(previous_raw, unit, scale),
+            forecast=_display(forecast_raw, unit, scale),
+            te_forecast=None,
             importance=importance,
-            unit=item.get("Unit", "") or "",
-            source=item.get("Source", "") or "",
-            actual_value=_num(item, "ActualValue", "Actual"),
-            previous_value=_num(item, "PreviousValue", "Previous"),
-            forecast_value=_num(item, "ForecastValue", "Forecast"),
+            unit=unit,
+            source=item.get("source", "") or "TradingView Economic Calendar",
+            actual_value=_num(actual_raw),
+            previous_value=_num(previous_raw),
+            forecast_value=_num(forecast_raw),
         ))
     return events
 
