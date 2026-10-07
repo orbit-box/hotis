@@ -48,7 +48,7 @@ async def health():
     return {
         "ok": True,
         "time": datetime.now(ZoneInfo(settings.timezone)).isoformat(),
-        "country": settings.country,
+        "country_code": settings.country_code,
         "min_importance": settings.min_importance,
     }
 
